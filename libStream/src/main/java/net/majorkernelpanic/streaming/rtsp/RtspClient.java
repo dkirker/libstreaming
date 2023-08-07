@@ -41,6 +41,7 @@ import net.majorkernelpanic.streaming.rtp.RtpSocket;
 import android.os.Handler;
 import android.os.HandlerThread;
 import android.os.Looper;
+import android.util.Base64;
 import android.util.Log;
 
 /**
@@ -64,16 +65,6 @@ public class RtspClient {
     public final static int ERROR_WRONG_CREDENTIALS = 0x03;
 
     /**
-     * Use this to use UDP for the transport protocol.
-     */
-    public final static int TRANSPORT_UDP = RtpSocket.TRANSPORT_UDP;
-
-    /**
-     * Use this to use TCP for the transport protocol.
-     */
-    public final static int TRANSPORT_TCP = RtpSocket.TRANSPORT_TCP;
-
-    /**
      * Message sent when the connection with the RTSP server has been lost for
      * some reason (for example, the user is going under a bridge).
      * When the connection with the server is lost, the client will automatically try to
@@ -87,6 +78,36 @@ public class RtspClient {
      * reconnect as long as {@link #stopStream()} is not called.
      */
     public final static int MESSAGE_CONNECTION_RECOVERED = 0x05;
+
+    /**
+     * Use this to use UDP for the transport protocol.
+     */
+    public final static int TRANSPORT_UDP = RtpSocket.TRANSPORT_UDP;
+
+    /**
+     * Use this to use TCP for the transport protocol.
+     */
+    public final static int TRANSPORT_TCP = RtpSocket.TRANSPORT_TCP;
+
+    /**
+     * Disable connection authentication.
+     */
+    public final static int AUTHENTICATION_NONE = 0x00;
+
+    /**
+     * Use the server's response to determine authentication type.
+     */
+    public final static int AUTHENTICATION_AUTO = 0x01;
+
+    /**
+     * Use HTTP Basic authentication. Requires username and password to be set.
+     */
+    public final static int AUTHENTICATION_BASIC = 0x02;
+
+    /**
+     * Use HTTP Digest authentication. Requires username and password to be set.
+     */
+    public final static int AUTHENTICATION_DIGEST = 0x03;
 
     private final static int STATE_STARTED = 0x00;
     private final static int STATE_STARTING = 0x01;
@@ -102,6 +123,7 @@ public class RtspClient {
         public Session session;
         public int port;
         public int transport;
+        public int authmethod;
 
         public Parameters clone() {
             Parameters params = new Parameters();
@@ -112,6 +134,7 @@ public class RtspClient {
             params.session = session;
             params.port = port;
             params.transport = transport;
+            params.authmethod = authmethod;
             return params;
         }
     }
@@ -144,6 +167,7 @@ public class RtspClient {
         mTmpParameters.port = 1935;
         mTmpParameters.path = "/";
         mTmpParameters.transport = TRANSPORT_UDP;
+        mTmpParameters.authmethod = AUTHENTICATION_NONE;
         mAuthorization = null;
         mCallback = null;
         mMainHandler = new Handler(Looper.getMainLooper());
@@ -195,6 +219,17 @@ public class RtspClient {
     }
 
     /**
+     * Call this with {@link #AUTHENTICATION_NONE}, {@link #AUTHENTICATION_AUTO},
+     * {@link #AUTHENTICATION_BASIC}, or {@link #AUTHENTICATION_DIGEST} to choose the
+     * authentication method that will be used to send RTP/RTCP packets.
+     * Methods of {@link #AUTHENTICATION_AUTO}, {@link #AUTHENTICATION_BASIC},
+     * or {@link #AUTHENTICATION_DIGEST} require credentials to be set with {@link #setCredentials}.
+     */
+    public void setAuthenticationMethod(int method) {
+        mTmpParameters.authmethod = method;
+    }
+
+    /**
      * If authentication is enabled on the server, you need to call this with a valid login/password pair.
      * Only implements Digest Access Authentication according to RFC 2069.
      *
@@ -216,7 +251,7 @@ public class RtspClient {
     }
 
     /**
-     * Call this with {@link #TRANSPORT_TCP} or {@value #TRANSPORT_UDP} to choose the
+     * Call this with {@link #TRANSPORT_TCP} or {@link #TRANSPORT_UDP} to choose the
      * transport protocol that will be used to send RTP/RTCP packets.
      * Not ready yet !
      */
@@ -335,6 +370,7 @@ public class RtspClient {
         String body = mParameters.session.getSessionDescription();
         String request = "ANNOUNCE rtsp://" + mParameters.host + ":" + mParameters.port + mParameters.path + " RTSP/1.0\r\n" +
                 "CSeq: " + (++mCSeq) + "\r\n" +
+                (mParameters.authmethod == AUTHENTICATION_BASIC ? addBasicAuthorization() : "") +
                 "Content-Length: " + body.length() + "\r\n" +
                 "Content-Type: application/sdp\r\n\r\n" +
                 body;
@@ -352,7 +388,7 @@ public class RtspClient {
 
         if (response.headers.containsKey("session")) {
             try {
-                Matcher m = Response.rexegSession.matcher(response.headers.get("session"));
+                Matcher m = Response.regexSession.matcher(response.headers.get("session"));
                 m.find();
                 mSessionID = m.group(1);
             } catch (Exception e) {
@@ -367,38 +403,48 @@ public class RtspClient {
             if (mParameters.username == null || mParameters.password == null)
                 throw new IllegalStateException("Authentication is enabled and setCredentials(String,String) was not called !");
 
-            try {
-                m = Response.rexegAuthenticate.matcher(response.headers.get("www-authenticate"));
-                m.find();
-                nonce = m.group(2);
-                realm = m.group(1);
-            } catch (Exception e) {
+            String wwwAuthHeader = response.headers.get("www-authenticate");
+            if (wwwAuthHeader != null) {
+                if (wwwAuthHeader.contains("Digest")) {
+                    try {
+                        m = Response.regexAuthenticate.matcher(wwwAuthHeader);
+                        m.find();
+                        nonce = m.group(2);
+                        realm = m.group(1);
+                    } catch (Exception e) {
+                        throw new IOException("Invalid response from server");
+                    }
+
+                    String uri = "rtsp://" + mParameters.host + ":" + mParameters.port + mParameters.path;
+                    String hash1 = computeMd5Hash(mParameters.username + ":" + m.group(1) + ":" + mParameters.password);
+                    String hash2 = computeMd5Hash("ANNOUNCE" + ":" + uri);
+                    String hash3 = computeMd5Hash(hash1 + ":" + m.group(2) + ":" + hash2);
+
+                    mAuthorization = "Digest username=\"" + mParameters.username + "\",realm=\"" + realm + "\",nonce=\"" + nonce + "\",uri=\"" + uri + "\",response=\"" + hash3 + "\"";
+                } else if (wwwAuthHeader.contains("Basic")) { // Chances are, if we get this after already sending auth we have invalid credentials
+                    addBasicAuthorization(); // We generate and set mAuthorization in this call, which we use below
+                } else {
+                    throw new IOException("Unsupported auth method from server");
+                }
+
+                request = "ANNOUNCE rtsp://" + mParameters.host + ":" + mParameters.port + mParameters.path + " RTSP/1.0\r\n" +
+                        "CSeq: " + (++mCSeq) + "\r\n" +
+                        "Content-Length: " + body.length() + "\r\n" +
+                        "Authorization: " + mAuthorization + "\r\n" +
+                        "Session: " + mSessionID + "\r\n" +
+                        "Content-Type: application/sdp\r\n\r\n" +
+                        body;
+
+                Log.i(TAG, request.substring(0, request.indexOf("\r\n")));
+
+                mOutputStream.write(request.getBytes("UTF-8"));
+                mOutputStream.flush();
+                response = Response.parseResponse(mBufferedReader);
+
+                if (response.status == 401) throw new RuntimeException("Bad credentials !");
+            } else {
                 throw new IOException("Invalid response from server");
             }
-
-            String uri = "rtsp://" + mParameters.host + ":" + mParameters.port + mParameters.path;
-            String hash1 = computeMd5Hash(mParameters.username + ":" + m.group(1) + ":" + mParameters.password);
-            String hash2 = computeMd5Hash("ANNOUNCE" + ":" + uri);
-            String hash3 = computeMd5Hash(hash1 + ":" + m.group(2) + ":" + hash2);
-
-            mAuthorization = "Digest username=\"" + mParameters.username + "\",realm=\"" + realm + "\",nonce=\"" + nonce + "\",uri=\"" + uri + "\",response=\"" + hash3 + "\"";
-
-            request = "ANNOUNCE rtsp://" + mParameters.host + ":" + mParameters.port + mParameters.path + " RTSP/1.0\r\n" +
-                    "CSeq: " + (++mCSeq) + "\r\n" +
-                    "Content-Length: " + body.length() + "\r\n" +
-                    "Authorization: " + mAuthorization + "\r\n" +
-                    "Session: " + mSessionID + "\r\n" +
-                    "Content-Type: application/sdp\r\n\r\n" +
-                    body;
-
-            Log.i(TAG, request.substring(0, request.indexOf("\r\n")));
-
-            mOutputStream.write(request.getBytes("UTF-8"));
-            mOutputStream.flush();
-            response = Response.parseResponse(mBufferedReader);
-
-            if (response.status == 401) throw new RuntimeException("Bad credentials !");
-
         } else if (response.status == 403) {
             throw new RuntimeException("Access forbidden !");
         }
@@ -427,7 +473,7 @@ public class RtspClient {
 
                 if (response.headers.containsKey("session")) {
                     try {
-                        m = Response.rexegSession.matcher(response.headers.get("session"));
+                        m = Response.regexSession.matcher(response.headers.get("session"));
                         m.find();
                         mSessionID = m.group(1);
                     } catch (Exception e) {
@@ -437,7 +483,7 @@ public class RtspClient {
 
                 if (mParameters.transport == TRANSPORT_UDP) {
                     try {
-                        m = Response.rexegTransport.matcher(response.headers.get("transport"));
+                        m = Response.regexTransport.matcher(response.headers.get("transport"));
                         m.find();
                         stream.setDestinationPorts(Integer.parseInt(m.group(3)), Integer.parseInt(m.group(4)));
                         Log.d(TAG, "Setting destination ports: " + Integer.parseInt(m.group(3)) + ", " + Integer.parseInt(m.group(4)));
@@ -485,6 +531,24 @@ public class RtspClient {
         mOutputStream.write(request.getBytes("UTF-8"));
         mOutputStream.flush();
         Response.parseResponse(mBufferedReader);
+    }
+
+    private String addBasicAuthorization() {
+        String authHeader = "";
+
+        if (mParameters.username != null && mParameters.password != null) {
+            // TODO: There are some considerations for HTTP Basic that should be considered that aren't. So consider them.
+            //   See: RFC-7617
+            try {
+                String credentials = mParameters.username + ":" + mParameters.password;
+                mAuthorization = "Basic " + Base64.encodeToString(credentials.getBytes("UTF-8"), Base64.NO_WRAP);
+                authHeader = "Authorization: " + mAuthorization + "\r\n";
+            } catch (Exception e) {
+                Log.e(TAG, "Exception encoding credentials: ", e);
+            }
+        }
+
+        return authHeader;
     }
 
     private String addHeaders() {
@@ -596,13 +660,13 @@ public class RtspClient {
         // Parses method & uri
         public static final Pattern regexStatus = Pattern.compile("RTSP/\\d.\\d (\\d+) (\\w+)", Pattern.CASE_INSENSITIVE);
         // Parses a request header
-        public static final Pattern rexegHeader = Pattern.compile("(\\S+):(.+)", Pattern.CASE_INSENSITIVE);
+        public static final Pattern regexHeader = Pattern.compile("(\\S+):(.+)", Pattern.CASE_INSENSITIVE);
         // Parses a WWW-Authenticate header
-        public static final Pattern rexegAuthenticate = Pattern.compile("realm=\"(.+)\",\\s+nonce=\"(\\w+)\"", Pattern.CASE_INSENSITIVE);
+        public static final Pattern regexAuthenticate = Pattern.compile("realm=\"(.+)\",\\s+nonce=\"(\\w+)\"", Pattern.CASE_INSENSITIVE);
         // Parses a Session header
-        public static final Pattern rexegSession = Pattern.compile("(\\d+)", Pattern.CASE_INSENSITIVE);
+        public static final Pattern regexSession = Pattern.compile("(\\d+)", Pattern.CASE_INSENSITIVE);
         // Parses a Transport header
-        public static final Pattern rexegTransport = Pattern.compile("client_port=(\\d+)-(\\d+).+server_port=(\\d+)-(\\d+)", Pattern.CASE_INSENSITIVE);
+        public static final Pattern regexTransport = Pattern.compile("client_port=(\\d+)-(\\d+).+server_port=(\\d+)-(\\d+)", Pattern.CASE_INSENSITIVE);
 
 
         public int status;
@@ -625,7 +689,7 @@ public class RtspClient {
             while ((line = input.readLine()) != null) {
                 //Log.e(TAG,"l: "+line.length()+", c: "+line);
                 if (line.length() > 3) {
-                    matcher = rexegHeader.matcher(line);
+                    matcher = regexHeader.matcher(line);
                     matcher.find();
                     response.headers.put(matcher.group(1).toLowerCase(Locale.US), matcher.group(2));
                 } else {
